@@ -1,0 +1,15 @@
+{
+  "id": "bd863b5d-4766-459a-b664-3212b6a5ff24",
+  "timestamp": "2026-03-13T22:14:52.953Z",
+  "url": "https://apnews.com",
+  "title": "Associated Press News: Breaking News | Latest News Today",
+  "domain": "apnews.com",
+  "author": "live",
+  "fakeProbability": 0.09038461538461537,
+  "verdict": "Credible / Well-Sourced",
+  "confidence": "High",
+  "sourcesFound": 25,
+  "credibleSources": 25,
+  "redditMentions": 15,
+  "twitterMentions": 0
+}
