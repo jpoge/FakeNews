@@ -317,46 +317,50 @@ function renderGauge(prob) {
 }
 
 // ── Overview: Factors ─────────────────────────────────────
+const SNOPES_VERDICT_LABELS = {
+  'false':        { text: 'FALSE — Snopes rated this story false',              score: 2  },
+  'mostly-false': { text: 'MOSTLY FALSE — Snopes rated this mostly false',      score: 15 },
+  'mixed':        { text: 'MIXED / UNVERIFIED — Snopes rated this as mixed',    score: 45 },
+  'mostly-true':  { text: 'MOSTLY TRUE — Snopes rated this mostly true',        score: 80 },
+  'true':         { text: 'TRUE — Snopes confirmed this story as true',         score: 98 },
+};
+
 function renderFactors(factors, domRep, content, prob) {
   const el = qs('factorsList');
+
+  const snopesEntry = factors.snopesVerdict && SNOPES_VERDICT_LABELS[factors.snopesVerdict];
 
   const items = [
     {
       label: 'Domain Credibility',
       desc: domRep.label,
       value: domRep.score,
-      good: true,
-      contribution: Math.round((100 - domRep.score) * 0.30),
     },
     {
       label: 'Corroboration',
       desc: `${factors.credibleSourcesCount} credible source(s) cover this story`,
       value: Math.min(100, factors.credibleSourcesCount * 10),
-      good: true,
-      contribution: null,
     },
     {
       label: 'Content Quality',
       desc: `${content.issues.length} issue(s) found, ${content.positives.length} positive signal(s)`,
       value: content.score,
-      good: true,
-      contribution: null,
     },
     {
       label: 'Questionable Amplification',
       desc: `${factors.questionableSources} low-credibility source(s) spreading story`,
       value: Math.max(0, 100 - factors.questionableSources * 20),
-      good: true,
-      contribution: null,
     },
     {
       label: 'Fact-Checker Coverage',
-      desc: factors.factCheckersFound > 0
-        ? `${factors.factCheckersFound} fact-checker(s) found`
-        : 'No fact-checker coverage found',
-      value: factors.factCheckersFound > 0 ? 85 : 40,
-      good: true,
-      contribution: null,
+      desc: snopesEntry
+        ? snopesEntry.text
+        : factors.factCheckersFound > 0
+          ? `${factors.factCheckersFound} fact-checker source(s) found`
+          : 'No Snopes or fact-checker coverage found',
+      value: snopesEntry
+        ? snopesEntry.score
+        : factors.factCheckersFound > 0 ? 85 : 40,
     },
   ];
 

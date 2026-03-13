@@ -437,7 +437,110 @@ async function searchTwitter(query) {
 }
 
 // ============================================================
-// 7. WAYBACK MACHINE (FREE)
+// 7. SNOPES FACT-CHECK SEARCH (FREE)
+// ============================================================
+
+// Map Snopes verdict text → our factChecked key
+function parseSnopesRating(raw) {
+  const s = raw.toLowerCase().trim();
+  if (s.includes('false') && !s.includes('mostly') && !s.includes('mixture')) return 'false';
+  if (s.includes('mostly false')) return 'mostly-false';
+  if (s.includes('mixture') || s.includes('mixed') || s.includes('unverified') ||
+      s.includes('outdated') || s.includes('legend') || s.includes('research in progress') ||
+      s.includes('correct attribution')) return 'mixed';
+  if (s.includes('mostly true')) return 'mostly-true';
+  if (s.includes('true') && !s.includes('mostly') && !s.includes('false')) return 'true';
+  if (s.includes('satire')) return 'mostly-false'; // labeled satire = intentionally fake
+  return null;
+}
+
+// Scrape a single Snopes article page for its verdict badge
+async function scrapeSnopesRating(articleUrl) {
+  try {
+    const res = await axios.get(articleUrl, {
+      headers: BROWSER_HEADERS,
+      timeout: 12000,
+    });
+    const $ = cheerio.load(res.data);
+
+    // Snopes uses several selectors across its layout versions
+    const ratingText =
+      $('span.rating_title_wrap').first().text().trim() ||
+      $('h3.rating_title_wrap').first().text().trim() ||
+      $('[class*="rating_title"]').first().text().trim() ||
+      $('[class*="fact-check__badge"]').first().text().trim() ||
+      $('[class*="claim-check__badge"]').first().text().trim() ||
+      $('span.rating').first().text().trim() ||
+      // Newer Snopes layout stores it in a <span> inside .fact_check
+      $('.fact_check span').first().text().trim() ||
+      $('div.title_rating span').first().text().trim() || '';
+
+    return ratingText ? parseSnopesRating(ratingText) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Search Snopes directly and return structured results with ratings
+async function searchSnopes(query) {
+  try {
+    const encoded = encodeURIComponent(query.substring(0, 80));
+    const res = await axios.get(`https://www.snopes.com/?s=${encoded}`, {
+      headers: BROWSER_HEADERS,
+      timeout: 14000,
+    });
+
+    const $ = cheerio.load(res.data);
+    const hits = [];
+
+    // Collect candidate result links from the search page
+    $('article, .card, .media, .result-item').each((i, el) => {
+      if (i >= 5) return false;
+      const anchor = $(el).find('h2 a, h3 a, h4 a, .title a, a[href*="/fact-check/"]').first();
+      const title  = anchor.text().trim();
+      const href   = anchor.attr('href');
+      if (title && href && href.includes('snopes.com')) {
+        // Grab any inline rating badge already rendered on the search page
+        const inlineRating =
+          $(el).find('[class*="rating_title"], [class*="rating-title"], .badge, .label').first().text().trim();
+        hits.push({ title, link: href, inlineRating });
+      }
+    });
+
+    if (hits.length === 0) return { results: [], verdict: null };
+
+    // Try to get a rating — first from inline badge, then by scraping the article
+    let verdict = null;
+    for (const hit of hits) {
+      if (hit.inlineRating) {
+        verdict = parseSnopesRating(hit.inlineRating);
+      }
+      if (!verdict) {
+        verdict = await scrapeSnopesRating(hit.link);
+      }
+      if (verdict) break;
+    }
+
+    return {
+      results: hits.map(h => ({
+        title:      h.title,
+        link:       h.link,
+        source:     'Snopes',
+        pubDate:    null,
+        reputation: { score: 92, category: 'factchecker', label: 'Snopes (Fact Checker)' },
+        domain:     'snopes.com',
+        rating:     h.inlineRating || null,
+      })),
+      verdict, // null | 'false' | 'mostly-false' | 'mixed' | 'mostly-true' | 'true'
+    };
+  } catch (err) {
+    console.warn('Snopes search error:', err.message);
+    return { results: [], verdict: null };
+  }
+}
+
+// ============================================================
+// 7b. WAYBACK MACHINE (FREE)
 // ============================================================
 async function checkWaybackMachine(url) {
   try {
@@ -557,49 +660,61 @@ function analyzeContent(title, content) {
 // ============================================================
 function calculateFakeProbability(factors) {
   const {
-    domainScore,           // 0–100 (higher = more credible)
-    corroborationCount,    // number of credible sources corroborating
-    contentScore,          // 0–100 (higher = better quality)
+    domainScore,             // 0–100 (higher = more credible)
+    domainCategory,          // 'credible' | 'fake' | 'satire' | 'questionable' | 'mixed' | 'unknown' …
+    corroborationCount,      // number of credible sources corroborating
+    contentScore,            // 0–100 (higher = better quality)
     questionableSourceCount, // number of low-credibility sources pushing same story
-    factChecked,           // null | 'false' | 'mostly-false' | 'mixed' | 'mostly-true' | 'true'
-    redditMentions,        // integer
-    twitterMentions,       // integer
-    waybackSnapshots,      // integer — older article = slightly more credible
-    isSatireDomain,
+    factChecked,             // null | 'false' | 'mostly-false' | 'mixed' | 'mostly-true' | 'true'
+    redditMentions,          // integer
+    twitterMentions,         // integer
+    waybackSnapshots,        // integer
   } = factors;
 
-  // Satire domains are a special case
-  if (isSatireDomain) return 0.92;
+  // ── Hard floors by domain category ───────────────────────
+  // Known-fake and satire domains should always score above a baseline
+  // regardless of what the rest of the signals say.
+  const CATEGORY_FLOORS = {
+    fake:        0.85,  // known misinformation sites — always "Likely Fake News"
+    satire:      0.90,  // satire sites — content is intentionally fabricated
+    questionable:0.62,  // low-credibility / extreme-bias sites — at minimum "Questionable"
+  };
+  const floor = CATEGORY_FLOORS[domainCategory] ?? 0;
 
-  // ── Domain score contribution (weight 0.30) ──────────────
+  // ── Domain score contribution (weight 0.35) ───────────────
+  // Higher weight than before so a known-bad source decisively drives the score up.
   const domainContrib = (100 - domainScore) / 100;
 
-  // ── Corroboration (weight 0.28) ───────────────────────────
+  // ── Corroboration (weight 0.23) ───────────────────────────
+  // More credible outlets covering the same story = less likely fake.
   const corrobContrib =
     corroborationCount >= 10 ? 0.05 :
     corroborationCount >= 5  ? 0.12 :
     corroborationCount >= 3  ? 0.25 :
-    corroborationCount >= 1  ? 0.40 :
-    0.70; // No credible corroboration
+    corroborationCount >= 1  ? 0.42 :
+    0.72; // No credible corroboration at all
 
   // ── Content quality (weight 0.15) ─────────────────────────
   const contentContrib = (100 - contentScore) / 100;
 
   // ── Fact check (weight 0.22 if available, else 0) ─────────
   const factCheckMap = {
-    'false': 0.97, 'mostly-false': 0.82, 'mixed': 0.55,
-    'mostly-true': 0.20, 'true': 0.05,
+    'false':       0.97,
+    'mostly-false':0.84,
+    'mixed':       0.55,
+    'mostly-true': 0.20,
+    'true':        0.04,
   };
   const factContrib = factChecked ? (factCheckMap[factChecked] ?? 0.5) : null;
 
   // ── Questionable amplification (weight 0.05) ─────────────
-  const amplContrib = questionableSourceCount > 3 ? 0.8 : questionableSourceCount > 0 ? 0.6 : 0.2;
+  const amplContrib = questionableSourceCount > 3 ? 0.85 : questionableSourceCount > 0 ? 0.65 : 0.20;
 
   // ── Build weighted sum ─────────────────────────────────────
   const hasFactCheck = factContrib !== null;
   const weights = {
-    domain:       0.30,
-    corroboration:0.28,
+    domain:       0.35,
+    corroboration:0.23,
     content:      0.15,
     factCheck:    hasFactCheck ? 0.22 : 0,
     amplification:0.05,
@@ -613,7 +728,8 @@ function calculateFakeProbability(factors) {
     (weights.factCheck    / totalWeight) * (factContrib ?? 0) +
     (weights.amplification/ totalWeight) * amplContrib;
 
-  return Math.min(0.99, Math.max(0.01, raw));
+  // Apply category floor, then clamp to [0.01, 0.99]
+  return Math.min(0.99, Math.max(floor, Math.max(0.01, raw)));
 }
 
 // ============================================================
@@ -752,23 +868,30 @@ app.post('/api/analyze', async (req, res) => {
     console.log('  [4/7] Searching Reddit...');
     console.log('  [5/7] Checking Wayback Machine & Twitter...');
 
-    const [gnRes, naRes, bnRes, rdRes, twRes, wbRes] = await Promise.allSettled([
+    const [gnRes, naRes, bnRes, rdRes, twRes, wbRes, snRes] = await Promise.allSettled([
       searchGoogleNews(searchQuery),
       searchNewsAPI(searchQuery),
       searchBingNews(searchQuery),
       searchReddit(searchQuery),
       searchTwitter(searchQuery),
       checkWaybackMachine(url),
+      searchSnopes(searchQuery),
     ]);
 
-    const googleNews  = gnRes.status === 'fulfilled' ? gnRes.value : [];
-    const newsApi     = naRes.status === 'fulfilled' ? naRes.value : [];
-    const bingNews    = bnRes.status === 'fulfilled' ? bnRes.value : [];
-    const reddit      = rdRes.status === 'fulfilled' ? rdRes.value : [];
-    const twitter     = twRes.status === 'fulfilled' ? twRes.value : [];
-    const wayback     = wbRes.status === 'fulfilled' ? wbRes.value : [];
+    const googleNews   = gnRes.status === 'fulfilled' ? gnRes.value : [];
+    const newsApi      = naRes.status === 'fulfilled' ? naRes.value : [];
+    const bingNews     = bnRes.status === 'fulfilled' ? bnRes.value : [];
+    const reddit       = rdRes.status === 'fulfilled' ? rdRes.value : [];
+    const twitter      = twRes.status === 'fulfilled' ? twRes.value : [];
+    const wayback      = wbRes.status === 'fulfilled' ? wbRes.value : [];
+    const snopesData   = snRes.status === 'fulfilled' ? snRes.value : { results: [], verdict: null };
+    const snopesVerdict = snopesData.verdict; // null | 'false' | 'mostly-false' | 'mixed' | 'mostly-true' | 'true'
 
-    // Deduplicate by domain
+    if (snopesVerdict) {
+      console.log(`  ℹ Snopes verdict found: ${snopesVerdict}`);
+    }
+
+    // Combine all news sources; Snopes results are pre-enriched
     const allNews = [...googleNews, ...newsApi, ...bingNews];
 
     // ─── Step 6: Domain & content analysis ───────────────
@@ -786,22 +909,26 @@ app.post('/api/analyze', async (req, res) => {
       }
     });
 
-    const credibleSources     = enrichedSources.filter(s => s.reputation.score >= 80);
-    const questionableSources = enrichedSources.filter(s => s.reputation.score < 40);
-    const factCheckerSources  = enrichedSources.filter(s => s.reputation.category === 'factchecker');
+    // Merge Snopes results into the enriched list (already have reputation set)
+    const snopesEnriched = snopesData.results.map(r => ({ ...r }));
+    const allEnriched    = [...enrichedSources, ...snopesEnriched];
+
+    const credibleSources     = allEnriched.filter(s => s.reputation.score >= 80);
+    const questionableSources = allEnriched.filter(s => s.reputation.score < 40);
+    const factCheckerSources  = allEnriched.filter(s => s.reputation.category === 'factchecker');
 
     // ─── Step 7: Score ────────────────────────────────────
     console.log('  [7/7] Calculating fake probability...');
     const factors = {
-      domainScore:           domainRep.score,
-      corroborationCount:    credibleSources.length,
-      contentScore:          contentAnalysis.score,
+      domainScore:             domainRep.score,
+      domainCategory:          domainRep.category,
+      corroborationCount:      credibleSources.length,
+      contentScore:            contentAnalysis.score,
       questionableSourceCount: questionableSources.length,
-      factChecked:           null,
-      redditMentions:        reddit.length,
-      twitterMentions:       twitter.length,
-      waybackSnapshots:      wayback.length,
-      isSatireDomain:        domainRep.category === 'satire',
+      factChecked:             snopesVerdict,   // set from Snopes, null if not found
+      redditMentions:          reddit.length,
+      twitterMentions:         twitter.length,
+      waybackSnapshots:        wayback.length,
     };
 
     const fakeProbability = calculateFakeProbability(factors);
@@ -819,7 +946,7 @@ app.post('/api/analyze', async (req, res) => {
       credibleSources.length > 3 ? 'Medium' : 'Low';
 
     // ─── Build graph ──────────────────────────────────────
-    const linkGraph = buildLinkGraph(url, enrichedSources.slice(0, 35), reddit, twitter);
+    const linkGraph = buildLinkGraph(url, allEnriched.slice(0, 35), reddit, twitter);
 
     // ─── Build timeline ───────────────────────────────────
     const timelineEvents = [];
@@ -829,7 +956,7 @@ app.post('/api/analyze', async (req, res) => {
         title: article.title || url, url, type: 'origin', reputation: domainRep,
       });
     }
-    enrichedSources.forEach(s => {
+    allEnriched.forEach(s => {
       if (s.pubDate) {
         timelineEvents.push({
           date: s.pubDate, source: s.domain || s.source,
@@ -869,6 +996,7 @@ app.post('/api/analyze', async (req, res) => {
           totalNewsFound:         allNews.length,
           questionableSources:    questionableSources.length,
           factCheckersFound:      factCheckerSources.length,
+          snopesVerdict:          snopesVerdict,
           redditMentions:         reddit.length,
           twitterMentions:        twitter.length,
           waybackSnapshots:       wayback.length,
@@ -877,7 +1005,7 @@ app.post('/api/analyze', async (req, res) => {
       linkGraph,
       timeline: timelineEvents.slice(0, 60),
       sources: {
-        news:         enrichedSources.slice(0, 40),
+        news:         allEnriched.slice(0, 40),
         reddit:       reddit.slice(0, 15),
         twitter:      twitter.slice(0, 15),
         wayback:      wayback.slice(0, 10),
