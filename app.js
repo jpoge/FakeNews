@@ -7,9 +7,11 @@
 const API_BASE = 'http://localhost:3000';
 
 // ── App state ─────────────────────────────────────────────
-let currentResult   = null;
-let currentGraphSvg = null;
-let graphZoom       = null;
+let currentResult      = null;
+let currentGraphSvg    = null;
+let graphZoom          = null;
+let llmProviders       = [];
+let llmSelectedProvider = null;
 
 // ── Color maps ────────────────────────────────────────────
 const CAT_COLOR = {
@@ -70,6 +72,47 @@ function escHtml(str) {
   return d.innerHTML;
 }
 
+// ── LLM provider selection ────────────────────────────────
+const LLM_PROVIDER_COLORS = {
+  claude: '#7c3aed',
+  openai: '#059669',
+  gemini: '#2563eb',
+};
+
+function onLlmToggle() {
+  const enabled = qs('llmToggle').checked;
+  qs('llmProviderList').classList.toggle('hidden', !enabled);
+}
+
+function selectLlmProvider(id) {
+  llmSelectedProvider = id;
+  document.querySelectorAll('.llm-provider-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.provider === id);
+  });
+}
+
+function initLlmProviders(providers) {
+  llmProviders = providers;
+  const list = qs('llmProviderList');
+  if (!list) return;
+
+  if (providers.length === 0) {
+    list.innerHTML = `<span class="llm-no-providers">No LLM keys configured — add keys to <code>.env</code></span>`;
+    return;
+  }
+
+  list.innerHTML = providers.map(p =>
+    `<button class="llm-provider-btn provider-${escHtml(p.id)}" data-provider="${escHtml(p.id)}"
+       onclick="selectLlmProvider('${escHtml(p.id)}')"
+       title="${escHtml(p.vendor)} · ${escHtml(p.model)}">
+       ${escHtml(p.name)}
+     </button>`
+  ).join('');
+
+  // Auto-select first provider
+  selectLlmProvider(providers[0].id);
+}
+
 // ── Section switching ─────────────────────────────────────
 function switchSection(name) {
   ['analyze', 'logs'].forEach(s => {
@@ -114,10 +157,12 @@ function showError(msg) {
 function dismissError() { qs('errorBanner').classList.add('hidden'); }
 
 // ── Progress steps ────────────────────────────────────────
-const STEP_DELAYS = [0, 800, 1800, 3200, 5000];
+const STEP_DELAYS = [0, 800, 1800, 3200, 5000, 6500];
 
 function animateProgress() {
-  const steps = document.querySelectorAll('.prog-step');
+  // Only animate steps that are currently visible
+  const steps = Array.from(document.querySelectorAll('.prog-step'))
+    .filter(s => !s.classList.contains('hidden'));
   steps.forEach(s => { s.classList.remove('active', 'done'); });
 
   let i = 0;
@@ -150,6 +195,11 @@ async function analyzeUrl() {
   qs('analyzeBtn').classList.add('loading');
   qs('analyzeBtn').querySelector('.btn-label').textContent = 'Analyzing…';
 
+  // Show/hide LLM progress step based on toggle
+  const llmEnabled = !!(qs('llmToggle')?.checked && llmSelectedProvider);
+  const step6 = qs('pStep6');
+  if (step6) step6.classList.toggle('hidden', !llmEnabled);
+
   // Animate steps
   animateProgress();
 
@@ -157,7 +207,7 @@ async function analyzeUrl() {
     const res = await fetch(`${API_BASE}/api/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, llmEnabled, llmProvider: llmSelectedProvider }),
     });
 
     if (!res.ok) {
@@ -244,8 +294,9 @@ function renderResults(data) {
   switchTab('overview');
 
   // ── Overview panels
-  renderFactors(factors, domRep, content, prob);
+  renderFactors(factors, domRep, content, prob, analysis.llmAnalysis, analysis.llmProvider);
   renderContentAnalysis(content);
+  renderLlmAnalysis(analysis.llmAnalysis, analysis.llmProvider);
   renderApiStatus(apiStatus);
   renderFactCheckers(sources.factCheckers);
 
@@ -325,7 +376,58 @@ const SNOPES_VERDICT_LABELS = {
   'true':         { text: 'TRUE — Snopes confirmed this story as true',         score: 98 },
 };
 
-function renderFactors(factors, domRep, content, prob) {
+// ── Overview: LLM Analysis ────────────────────────────────
+function renderLlmAnalysis(llmAnalysis, provider) {
+  const card    = qs('llmAnalysisCard');
+  const content = qs('llmAnalysisContent');
+  const badge   = qs('llmProviderBadge');
+  if (!card) return;
+
+  if (!llmAnalysis) {
+    card.classList.add('hidden');
+    return;
+  }
+
+  const info = {
+    claude: { name: 'Claude',   vendor: 'Anthropic', color: '#7c3aed' },
+    openai: { name: 'ChatGPT',  vendor: 'OpenAI',    color: '#059669' },
+    gemini: { name: 'Gemini',   vendor: 'Google',    color: '#2563eb' },
+  }[provider] || { name: provider || 'AI', vendor: '', color: '#6366f1' };
+
+  badge.innerHTML = `<span class="llm-result-badge" style="background:${info.color}18;color:${info.color};border-color:${info.color}35">${escHtml(info.name)} · ${escHtml(info.vendor)}</span>`;
+
+  const score  = llmAnalysis.credibilityScore ?? 50;
+  const col    = scoreColor(score);
+
+  const flagsHtml = llmAnalysis.flags?.length
+    ? `<p class="llm-section-label">Concerns:</p>
+       <ul class="issue-list">${llmAnalysis.flags.map(f => `<li><span class="issue-icon" style="color:var(--red)">⚠</span>${escHtml(f)}</li>`).join('')}</ul>`
+    : '';
+
+  const posHtml = llmAnalysis.positives?.length
+    ? `<p class="llm-section-label">Positives:</p>
+       <ul class="positive-list">${llmAnalysis.positives.map(p => `<li><span class="issue-icon" style="color:var(--green)">✓</span>${escHtml(p)}</li>`).join('')}</ul>`
+    : '';
+
+  content.innerHTML = `
+    <div class="content-score-row">
+      <div class="content-score-badge" style="color:${col}">${score}</div>
+      <div>
+        <div class="content-score-label" style="font-weight:700">Credibility Score</div>
+        <div class="content-score-sub">out of 100</div>
+      </div>
+      <div class="factor-bar-bg" style="flex:1;margin-left:12px">
+        <div class="factor-bar-fill" style="width:${score}%;background:${col}"></div>
+      </div>
+    </div>
+    ${llmAnalysis.reasoning ? `<p class="llm-reasoning">${escHtml(llmAnalysis.reasoning)}</p>` : ''}
+    ${flagsHtml}
+    ${posHtml}
+  `;
+  card.classList.remove('hidden');
+}
+
+function renderFactors(factors, domRep, content, prob, llmAnalysis, llmProvider) {
   const el = qs('factorsList');
 
   const snopesEntry = factors.snopesVerdict && SNOPES_VERDICT_LABELS[factors.snopesVerdict];
@@ -363,6 +465,17 @@ function renderFactors(factors, domRep, content, prob) {
         : factors.factCheckersFound > 0 ? 85 : 40,
     },
   ];
+
+  if (llmAnalysis) {
+    const provName = { claude: 'Claude', openai: 'ChatGPT', gemini: 'Gemini' }[llmProvider] || 'AI';
+    items.push({
+      label: `AI Analysis (${provName})`,
+      desc:  llmAnalysis.reasoning
+        ? llmAnalysis.reasoning.slice(0, 90) + (llmAnalysis.reasoning.length > 90 ? '…' : '')
+        : `Credibility score: ${llmAnalysis.credibilityScore}/100`,
+      value: llmAnalysis.credibilityScore ?? 50,
+    });
+  }
 
   el.innerHTML = items.map(item => {
     const bar = Math.max(2, item.value);
@@ -427,7 +540,7 @@ function renderApiStatus(apiStatus) {
     { name: 'Bing News',       key: 'bingNews',    always: false },
   ];
 
-  el.innerHTML = services.map(s => {
+  let html = services.map(s => {
     const active = apiStatus[s.key] || s.always;
     const label  = active ? 'Active' : 'Not configured';
     return `
@@ -436,6 +549,19 @@ function renderApiStatus(apiStatus) {
         <span class="api-status-badge ${active ? 'ok' : 'off'}">${label}</span>
       </div>`;
   }).join('');
+
+  if (apiStatus.llmProvider) {
+    const provNames = { claude: 'Claude (Anthropic)', openai: 'ChatGPT (OpenAI)', gemini: 'Gemini (Google)' };
+    const name  = provNames[apiStatus.llmProvider] || 'AI Analysis';
+    const ok    = apiStatus.llm;
+    html += `
+      <div class="api-status-item">
+        <span class="api-status-name">🤖 ${escHtml(name)}</span>
+        <span class="api-status-badge ${ok ? 'ok' : 'off'}">${ok ? 'Used' : 'Failed'}</span>
+      </div>`;
+  }
+
+  el.innerHTML = html;
 }
 
 // ── Overview: Fact Checkers ───────────────────────────────
@@ -831,6 +957,12 @@ function reAnalyzeFromLog(url) {
 
 // ── Init ──────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  // Fetch available LLM providers and populate selector
+  fetch(`${API_BASE}/api/llm-providers`)
+    .then(r => r.json())
+    .then(data => initLlmProviders(data.providers || []))
+    .catch(() => initLlmProviders([]));
+
   // Show API status in hero
   fetch(`${API_BASE}/api/logs`)
     .catch(() => {})

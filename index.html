@@ -81,6 +81,18 @@
         <span class="feature-tag">🗄️ Web Archive</span>
       </div>
 
+      <!-- LLM Options -->
+      <div class="llm-options" id="llmOptions">
+        <label class="llm-toggle-wrap" title="Use an AI model to semantically analyze article content">
+          <input type="checkbox" id="llmToggle" class="llm-toggle-input" onchange="onLlmToggle()" />
+          <span class="llm-toggle-track"></span>
+          <span class="llm-toggle-label-text">AI Analysis</span>
+        </label>
+        <div class="llm-providers hidden" id="llmProviderList">
+          <!-- filled by JS after fetching /api/llm-providers -->
+        </div>
+      </div>
+
       <div class="hero-apis" id="heroApis">
         <!-- API status dots filled by JS -->
       </div>
@@ -121,6 +133,9 @@
           </div>
           <div class="prog-step" id="pStep5">
             <div class="step-dot"></div><span>Calculating credibility score</span>
+          </div>
+          <div class="prog-step hidden" id="pStep6">
+            <div class="step-dot"></div><span>Running AI analysis…</span>
           </div>
         </div>
       </div>
@@ -214,6 +229,11 @@
           <div class="panel-card">
             <h3 class="panel-title">Content Quality Analysis</h3>
             <div id="contentAnalysis"></div>
+          </div>
+          <!-- AI Analysis (shown only when LLM was used) -->
+          <div class="panel-card hidden" id="llmAnalysisCard">
+            <h3 class="panel-title">AI Analysis <span id="llmProviderBadge"></span></h3>
+            <div id="llmAnalysisContent"></div>
           </div>
           <!-- API status -->
           <div class="panel-card">

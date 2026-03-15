@@ -7,6 +7,52 @@ const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
+// ============================================================
+// LLM CLIENT SETUP (lazy-loaded — only active when keys exist)
+// ============================================================
+let _anthropicClient = null;
+let _openaiClient    = null;
+let _geminiClient    = null;
+
+function getAnthropicClient() {
+  if (!process.env.ANTHROPIC_API_KEY) return null;
+  if (!_anthropicClient) {
+    try {
+      const Anthropic = require('@anthropic-ai/sdk');
+      _anthropicClient = new Anthropic();
+    } catch (e) {
+      console.warn('  ⚠ @anthropic-ai/sdk not installed. Run: npm install');
+    }
+  }
+  return _anthropicClient;
+}
+
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) return null;
+  if (!_openaiClient) {
+    try {
+      const OpenAI = require('openai');
+      _openaiClient = new OpenAI();
+    } catch (e) {
+      console.warn('  ⚠ openai package not installed. Run: npm install');
+    }
+  }
+  return _openaiClient;
+}
+
+function getGeminiClient() {
+  if (!process.env.GEMINI_API_KEY) return null;
+  if (!_geminiClient) {
+    try {
+      const { GoogleGenerativeAI } = require('@google/generative-ai');
+      _geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    } catch (e) {
+      console.warn('  ⚠ @google/generative-ai not installed. Run: npm install');
+    }
+  }
+  return _geminiClient;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -669,6 +715,7 @@ function calculateFakeProbability(factors) {
     redditMentions,          // integer
     twitterMentions,         // integer
     waybackSnapshots,        // integer
+    llmScore = null,         // 0–100 credibility from LLM, or null if not run
   } = factors;
 
   // ── Hard floors by domain category ───────────────────────
@@ -712,12 +759,15 @@ function calculateFakeProbability(factors) {
 
   // ── Build weighted sum ─────────────────────────────────────
   const hasFactCheck = factContrib !== null;
+  const llmContrib   = (llmScore !== null && llmScore !== undefined) ? (100 - llmScore) / 100 : null;
+
   const weights = {
     domain:       0.35,
     corroboration:0.23,
     content:      0.15,
-    factCheck:    hasFactCheck ? 0.22 : 0,
+    factCheck:    hasFactCheck  ? 0.22 : 0,
     amplification:0.05,
+    llm:          llmContrib !== null ? 0.17 : 0,
   };
   const totalWeight = Object.values(weights).reduce((a, b) => a + b, 0);
 
@@ -725,8 +775,9 @@ function calculateFakeProbability(factors) {
     (weights.domain       / totalWeight) * domainContrib +
     (weights.corroboration/ totalWeight) * corrobContrib +
     (weights.content      / totalWeight) * contentContrib +
-    (weights.factCheck    / totalWeight) * (factContrib ?? 0) +
-    (weights.amplification/ totalWeight) * amplContrib;
+    (weights.factCheck    / totalWeight) * (factContrib  ?? 0) +
+    (weights.amplification/ totalWeight) * amplContrib +
+    (weights.llm          / totalWeight) * (llmContrib   ?? 0);
 
   // Apply category floor, then clamp to [0.01, 0.99]
   return Math.min(0.99, Math.max(floor, Math.max(0.01, raw)));
@@ -841,10 +892,94 @@ function logSearch(data) {
 }
 
 // ============================================================
+// LLM ANALYSIS FUNCTION
+// ============================================================
+const LLM_SYSTEM = `You are a professional fact-checker and media literacy expert.
+Analyze the given article for signs of misinformation or fake news.
+Respond with valid JSON only — no markdown fences, no extra text.`;
+
+function buildLlmPrompt(title, url, excerpt) {
+  return `Analyze this article for fake news indicators.
+
+HEADLINE: ${title || '(no title)'}
+SOURCE URL: ${url}
+CONTENT (excerpt): ${excerpt}
+
+Respond with this exact JSON structure:
+{
+  "credibilityScore": <integer 0-100, where 100 = highly credible>,
+  "flags": ["list specific concerns found, or empty array"],
+  "positives": ["list credibility indicators found, or empty array"],
+  "reasoning": "<1-2 sentence summary of your assessment>"
+}`;
+}
+
+async function analyzeFakeNewsWithLLM(title, content, url, provider) {
+  const excerpt   = (content || '').slice(0, 2000);
+  const userMsg   = buildLlmPrompt(title, url, excerpt);
+
+  if (provider === 'claude') {
+    const client = getAnthropicClient();
+    if (!client) throw new Error('ANTHROPIC_API_KEY not configured');
+    const stream = client.messages.stream({
+      model:      'claude-opus-4-6',
+      max_tokens: 600,
+      thinking:   { type: 'adaptive' },
+      system:     LLM_SYSTEM,
+      messages:   [{ role: 'user', content: userMsg }],
+    });
+    const response  = await stream.finalMessage();
+    const textBlock = response.content.find(b => b.type === 'text');
+    if (!textBlock) throw new Error('No text block in Claude response');
+    return JSON.parse(textBlock.text);
+  }
+
+  if (provider === 'openai') {
+    const client = getOpenAIClient();
+    if (!client) throw new Error('OPENAI_API_KEY not configured');
+    const response = await client.chat.completions.create({
+      model:      'gpt-4o',
+      max_tokens: 600,
+      messages:   [
+        { role: 'system', content: LLM_SYSTEM },
+        { role: 'user',   content: userMsg },
+      ],
+    });
+    const text = response.choices[0]?.message?.content;
+    if (!text) throw new Error('Empty OpenAI response');
+    return JSON.parse(text);
+  }
+
+  if (provider === 'gemini') {
+    const genAI = getGeminiClient();
+    if (!genAI) throw new Error('GEMINI_API_KEY not configured');
+    const model  = genAI.getGenerativeModel({ model: 'gemini-1.5-pro' });
+    const result = await model.generateContent(`${LLM_SYSTEM}\n\n${userMsg}`);
+    const text   = result.response.text();
+    // Strip possible markdown code fences Gemini sometimes adds
+    const clean  = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+    return JSON.parse(clean);
+  }
+
+  throw new Error(`Unknown LLM provider: ${provider}`);
+}
+
+// ============================================================
+// LLM PROVIDERS ENDPOINT
+// ============================================================
+app.get('/api/llm-providers', (req, res) => {
+  const providers = [];
+  if (getAnthropicClient()) providers.push({ id: 'claude',  name: 'Claude',   vendor: 'Anthropic', model: 'claude-opus-4-6'   });
+  if (getOpenAIClient())    providers.push({ id: 'openai',  name: 'ChatGPT',  vendor: 'OpenAI',    model: 'gpt-4o'            });
+  if (getGeminiClient())    providers.push({ id: 'gemini',  name: 'Gemini',   vendor: 'Google',    model: 'gemini-1.5-pro'    });
+  res.json({ providers });
+});
+
+// ============================================================
 // MAIN ANALYSIS ENDPOINT
 // ============================================================
 app.post('/api/analyze', async (req, res) => {
-  const { url } = req.body;
+  const { url, llmEnabled = false, llmProvider = null } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
   try { new URL(url); }
@@ -917,6 +1052,19 @@ app.post('/api/analyze', async (req, res) => {
     const questionableSources = allEnriched.filter(s => s.reputation.score < 40);
     const factCheckerSources  = allEnriched.filter(s => s.reputation.category === 'factchecker');
 
+    // ─── LLM Analysis (optional) ──────────────────────────
+    let llmAnalysis = null;
+    if (llmEnabled && llmProvider) {
+      console.log(`  [LLM] Running AI analysis via ${llmProvider}...`);
+      try {
+        llmAnalysis = await analyzeFakeNewsWithLLM(article.title, article.content, url, llmProvider);
+        console.log(`  ✓ LLM credibility score: ${llmAnalysis.credibilityScore}`);
+      } catch (err) {
+        console.warn(`  ⚠ LLM analysis failed (${llmProvider}): ${err.message}`);
+      }
+    }
+    const llmScore = llmAnalysis ? llmAnalysis.credibilityScore : null;
+
     // ─── Step 7: Score ────────────────────────────────────
     console.log('  [7/7] Calculating fake probability...');
     const factors = {
@@ -925,10 +1073,11 @@ app.post('/api/analyze', async (req, res) => {
       corroborationCount:      credibleSources.length,
       contentScore:            contentAnalysis.score,
       questionableSourceCount: questionableSources.length,
-      factChecked:             snopesVerdict,   // set from Snopes, null if not found
+      factChecked:             snopesVerdict,
       redditMentions:          reddit.length,
       twitterMentions:         twitter.length,
       waybackSnapshots:        wayback.length,
+      llmScore,
     };
 
     const fakeProbability = calculateFakeProbability(factors);
@@ -990,6 +1139,8 @@ app.post('/api/analyze', async (req, res) => {
         confidence,
         domainReputation: domainRep,
         contentAnalysis,
+        llmAnalysis,
+        llmProvider: llmEnabled ? llmProvider : null,
         factors: {
           domainScore:            domainRep.score,
           credibleSourcesCount:   credibleSources.length,
@@ -1012,12 +1163,14 @@ app.post('/api/analyze', async (req, res) => {
         factCheckers: factCheckerSources.slice(0, 5),
       },
       apiStatus: {
-        googleNews: true,
-        newsApi:    !!process.env.NEWSAPI_KEY,
-        bingNews:   !!process.env.BING_NEWS_KEY,
-        reddit:     true,
-        twitter:    !!process.env.TWITTER_BEARER_TOKEN,
-        wayback:    true,
+        googleNews:  true,
+        newsApi:     !!process.env.NEWSAPI_KEY,
+        bingNews:    !!process.env.BING_NEWS_KEY,
+        reddit:      true,
+        twitter:     !!process.env.TWITTER_BEARER_TOKEN,
+        wayback:     true,
+        llm:         llmEnabled && llmAnalysis !== null,
+        llmProvider: llmEnabled ? llmProvider : null,
       },
     };
 

@@ -13,6 +13,9 @@
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "@anthropic-ai/sdk": "^0.52.0",
+    "openai": "^4.96.0",
+    "@google/generative-ai": "^0.21.0"
   }
 }
